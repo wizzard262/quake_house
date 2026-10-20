@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quake Map - My House</title>
+<style>
+  :root { --bg: #0b0b0d; --panel: rgba(20, 20, 24, 0.82); --text: #e8e4dc; --muted: #a39d92; --accent: #c8752e; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #hud { position: fixed; top: 12px; left: 12px; background: var(--panel); padding: 10px 14px; border-radius: 8px; max-width: 330px; }
+  #hud h1 { font-size: 15px; margin: 0 0 6px; color: var(--accent); letter-spacing: 0.04em; }
+  #hud select { background: #222; color: var(--text); border: 1px solid #444; border-radius: 4px; padding: 3px 6px; }
+  #hud p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+  #hud label { display: inline-flex; align-items: center; gap: 6px; }
+  kbd { background: #333; border-radius: 3px; padding: 0 4px; font-size: 11px; color: var(--text); }
+  #center { position: fixed; top: 32%; left: 0; right: 0; text-align: center; font: bold 22px/1.3 monospace; color: #e8c88a;
+            text-shadow: 2px 2px 0 #000; pointer-events: none; transition: opacity 0.4s; opacity: 0; white-space: pre-line; }
+  #cross { position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px; border: 1px solid #e8e4dc; border-radius: 50%; pointer-events: none; display: none; }
+  #tint { position: fixed; inset: 0; pointer-events: none; opacity: 0; transition: opacity 0.2s; }
+  #play { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+  #play span { background: var(--panel); padding: 12px 22px; border-radius: 8px; font-size: 18px; color: var(--accent); }
+  #status { position: fixed; bottom: 12px; left: 12px; background: var(--panel); padding: 6px 12px; border-radius: 6px; font: 13px monospace; }
+</style>
+</head>
+<body>
+<div id="tint"></div>
+<div id="hud">
+  <h1>QUAKE MAP - MY HOUSE</h1>
+  <p style="margin-top:0">beak8v &middot; 1 Nov 1997 &middot; <span id="info"></span></p>
+  <p>Ported with Claude Code so quake map is rendered in the browser with javascript.</p>
+  <p><b>Technologies:</b> JavaScript, three.js (WebGL) and GLSL shaders, Quake BSP collision hulls and movement ported to JavaScript, Python (map converter: geometry, textures with the Quake palette, baked lightmaps), GitHub Pages.</p>
+  <p><label>Brightness <input id="bright" type="range" min="0.6" max="2" step="0.05" value="1.25"></label></p>
+  <p>Click to play &middot; mouse to look &middot; <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &middot; <kbd>Space</kbd> jump / swim up &middot; <kbd>Shift</kbd> walk &middot;
+     <b>click</b> to shoot (some buttons and doors are shot, like in Quake) &middot; <kbd>N</kbd> noclip (fly, <kbd>Q</kbd>/<kbd>E</kbd> down/up) &middot; <kbd>R</kbd> restart &middot; <kbd>P</kbd> copy your position &middot; <kbd>Esc</kbd> free the mouse</p>
+</div>
+<div id="center"></div>
+<div id="cross"></div>
+<div id="play"><span>Click to play</span></div>
+<div id="status"></div>
+<script src="maps.js"></script>
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+// ---------- rendering setup ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0b0d);
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 1, 20000);
+camera.rotation.order = 'YXZ';
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+const dec = (b64, T) => { const s = atob(b64), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return new T(u.buffer); };
+const loadScript = src => new Promise((ok, fail) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = fail; document.body.appendChild(s); });
+const q2t = v => new THREE.Vector3(v[0], v[2], -v[1]);   // Quake (z up) -> three (y up)
+
+const VERT = `precision highp float;
+uniform mat4 modelViewMatrix; uniform mat4 projectionMatrix; uniform mat4 modelMatrix;
+attribute vec3 position; attribute vec2 uv; attribute vec2 lmuv; attribute float shade;
+varying vec2 vUv; varying vec2 vLm; varying float vShade; varying vec3 vQ;
+void main() {
+  vUv = uv; vLm = lmuv; vShade = shade;
+  vec3 w = (modelMatrix * vec4(position, 1.0)).xyz; vQ = vec3(w.x, -w.z, w.y);   // world position in Quake coordinates
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+// Quake-style texture x baked light; a gentle curve lifts dark interiors more than lit areas.
+const FRAG = `precision highp float;
+uniform sampler2D map; uniform sampler2D lightmap; uniform float hasMap; uniform float bright;
+uniform vec3 holeMin; uniform vec3 holeMax;
+varying vec2 vUv; varying vec2 vLm; varying float vShade; varying vec3 vQ;
+void main() {
+  if (all(greaterThan(vQ, holeMin)) && all(lessThan(vQ, holeMax))) discard;   // a doorway cut through a wall
+  vec3 t = hasMap > 0.5 ? texture2D(map, vUv).rgb : vec3(0.55);
+  float l = texture2D(lightmap, vLm).r;
+  float light = 2.0 * pow(clamp(l, 0.0, 1.0), 0.6) * bright + 0.06;
+  vec4 tx = hasMap > 0.5 ? texture2D(map, vUv) : vec4(0.55, 0.55, 0.55, 0.0);
+  gl_FragColor = vec4(mix(t * min(light, 2.2) * vShade, tx.rgb * 1.1, tx.a), 1.0);
+}`;
+const brightU = { value: 1.25 };
+const holeMinU = { value: new THREE.Vector3(1e9, 1e9, 1e9) }, holeMaxU = { value: new THREE.Vector3(1e9, 1e9, 1e9) };
+
+// Changes to the original map. beak8v: a doorway from the loft onto the flat roof (the roof is 28 units above
+// the loft floor, so a 14-unit step inside and a 14-unit sill make it walkable).
+const MAP_MODS = {
+  beak8v: { doorway: { min: [-45, 17, 90], max: [3, 27, 162] }, steps: [{ min: [-45, 27, 62], max: [3, 43, 76] }] },
+};
+const brightEl = document.getElementById('bright');
+try { const b = localStorage.getItem('qmv-bright'); if (b) brightEl.value = b; } catch (e) {}
+brightU.value = +brightEl.value;
+brightEl.oninput = () => { brightU.value = +brightEl.value; try { localStorage.setItem('qmv-bright', brightEl.value); } catch (e) {} };
+const loader = new THREE.TextureLoader();
+const grey = new THREE.DataTexture(new Uint8Array([140, 140, 140, 255]), 1, 1); grey.needsUpdate = true;
+
+// ---------- vector helpers (Quake coordinates) ----------
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const scl = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const len = a => Math.hypot(a[0], a[1], a[2]);
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const lerp3 = (a, b, f) => [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+const vec = s => (s || '0 0 0').split(/\s+/).map(Number);
+
+// ---------- Quake collision (clipping hulls, as in the original engine) ----------
+const EMPTY = -1, SOLID = -2, WATER = -3, SLIME = -4, LAVA = -5;
+const PMINS = [-16, -16, -24], PMAXS = [16, 16, 32];
+let C = null;
+const pdist = (pn, p) => { const t = C.pt[pn], o = pn * 4; return (t < 3 ? p[t] : C.pl[o] * p[0] + C.pl[o + 1] * p[1] + C.pl[o + 2] * p[2]) - C.pl[o + 3]; };
+function hullContents(num, p) { while (num >= 0) { const o = num * 3; num = pdist(C.clip[o], p) < 0 ? C.clip[o + 2] : C.clip[o + 1]; } return num; }
+function pointContents(p) {
+  let num = C.models[0].head0;
+  while (num >= 0) { const o = num * 3; num = pdist(C.nodes[o], p) < 0 ? C.nodes[o + 2] : C.nodes[o + 1]; }
+  return C.leafc[-1 - num];
+}
+const EPS = 0.03125;
+function rhc(head, num, p1f, p2f, p1, p2, tr) {
+  if (num < 0) {
+    if (num !== SOLID) { tr.allsolid = false; if (num === EMPTY) tr.inopen = true; else tr.inwater = true; } else tr.startsolid = true;
+    return true;
+  }
+  const o = num * 3, pn = C.clip[o];
+  const t1 = pdist(pn, p1), t2 = pdist(pn, p2);
+  if (t1 >= 0 && t2 >= 0) return rhc(head, C.clip[o + 1], p1f, p2f, p1, p2, tr);
+  if (t1 < 0 && t2 < 0) return rhc(head, C.clip[o + 2], p1f, p2f, p1, p2, tr);
+  let frac = Math.min(1, Math.max(0, t1 < 0 ? (t1 + EPS) / (t1 - t2) : (t1 - EPS) / (t1 - t2)));
+  let midf = p1f + (p2f - p1f) * frac, mid = lerp3(p1, p2, frac);
+  const side = t1 < 0 ? 1 : 0;
+  if (!rhc(head, C.clip[o + 1 + side], p1f, midf, p1, mid, tr)) return false;
+  if (hullContents(C.clip[o + 2 - side], mid) !== SOLID) return rhc(head, C.clip[o + 2 - side], midf, p2f, mid, p2, tr);
+  if (tr.allsolid) return false;
+  const po = pn * 4;
+  tr.normal = side ? [-C.pl[po], -C.pl[po + 1], -C.pl[po + 2]] : [C.pl[po], C.pl[po + 1], C.pl[po + 2]];
+  while (hullContents(head, mid) === SOLID) {
+    frac -= 0.1;
+    if (frac < 0) { tr.fraction = midf; tr.endpos = mid; return false; }
+    midf = p1f + (p2f - p1f) * frac; mid = lerp3(p1, p2, frac);
+  }
+  tr.fraction = midf; tr.endpos = mid;
+  return false;
+}
+function traceModel(head, offset, start, end) {
+  const s = sub(start, offset), e = sub(end, offset);
+  const tr = { fraction: 1, allsolid: true, startsolid: false, inopen: false, inwater: false, endpos: e, normal: null, ent: null };
+  rhc(head, head, 0, 1, s, e, tr);
+  tr.endpos = tr.fraction === 1 ? end.slice() : add(tr.endpos, offset);
+  return tr;
+}
+let solids = [], carve = null, boxes = [];
+const inBox = (p, b, e = 1e-6) => p[0] > b.min[0] - e && p[0] < b.max[0] + e && p[1] > b.min[1] - e && p[1] < b.max[1] + e && p[2] > b.min[2] - e && p[2] < b.max[2] + e;
+// segment vs box (player-expanded); returns the entering fraction and face normal, or null
+function sweepBox(p, q, b) {
+  let tmin = -Infinity, tmax = Infinity, n = null;
+  for (let i = 0; i < 3; i++) {
+    const d = q[i] - p[i];
+    if (Math.abs(d) < 1e-9) { if (p[i] <= b.min[i] || p[i] >= b.max[i]) return null; continue; }
+    const tIn = ((d > 0 ? b.min[i] : b.max[i]) - p[i]) / d, tOut = ((d > 0 ? b.max[i] : b.min[i]) - p[i]) / d;
+    if (tIn > tmin) { tmin = tIn; n = [0, 0, 0]; n[i] = d > 0 ? -1 : 1; }
+    tmax = Math.min(tmax, tOut);
+  }
+  if (tmin > tmax || tmax <= 0 || tmin >= 1) return null;
+  return { t: tmin, normal: n };
+}
+function hitResult(start, end, t, normal) {
+  const L = len(sub(end, start)) || 1, f = Math.max(0, t - EPS / L);
+  return { fraction: f, allsolid: false, startsolid: false, endpos: lerp3(start, end, f), normal, ent: null };
+}
+// world trace that treats the doorway as open: inside it only its sides, top and sill block you
+function traceWorld(start, end) {
+  const head = C.models[0].head1;
+  if (!carve) return traceModel(head, [0, 0, 0], start, end);
+  if (inBox(start, carve)) {
+    let tBlock = Infinity, nBlock = null, tY = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const d = end[i] - start[i]; if (Math.abs(d) < 1e-9) continue;
+      const t = ((d > 0 ? carve.max[i] : carve.min[i]) - start[i]) / d;
+      if (i === 1) tY = t;
+      else if (t < tBlock) { tBlock = t; nBlock = [0, 0, 0]; nBlock[i] = d > 0 ? -1 : 1; }
+    }
+    if (tBlock <= 1 && tBlock <= tY) return hitResult(start, end, Math.max(0, tBlock), nBlock);
+    if (tY > 1) return { fraction: 1, allsolid: false, startsolid: false, endpos: end.slice(), normal: null, ent: null };
+    const mid = lerp3(start, end, tY), rest = traceModel(head, [0, 0, 0], mid, end);
+    if (rest.startsolid) return hitResult(start, end, tY, [0, Math.sign(start[1] - end[1]), 0]);
+    const f = tY + (1 - tY) * rest.fraction;
+    return { ...rest, fraction: f, endpos: rest.fraction === 1 ? end.slice() : rest.endpos };
+  }
+  const w = traceModel(head, [0, 0, 0], start, end);
+  if (w.fraction === 1 && !w.startsolid) return w;
+  const enter = sweepBox(start, end, { min: sub(carve.min, [1e-4, 1e-4, 1e-4]), max: add(carve.max, [1e-4, 1e-4, 1e-4]) });
+  if (enter && enter.t >= 0 && enter.normal[1] !== 0 && enter.t <= w.fraction + 0.05) {
+    const t0 = enter.t + 1e-4, mid = lerp3(start, end, t0);
+    if (inBox(mid, carve)) {
+      const rest = traceWorld(mid, end);
+      return { ...rest, fraction: t0 + (1 - t0) * rest.fraction };
+    }
+  }
+  return w;
+}
+function trace(start, end, ignore) {
+  let best = traceWorld(start, end);
+  for (const b of boxes) {
+    if (inBox(start, b, -1e-6)) { best = { ...best, startsolid: true }; continue; }
+    const h = sweepBox(start, end, b);
+    if (h && h.t >= 0 && h.t < best.fraction) best = hitResult(start, end, h.t, h.normal);
+  }
+  const lo = [Math.min(start[0], end[0]) - 17, Math.min(start[1], end[1]) - 17, Math.min(start[2], end[2]) - 33];
+  const hi = [Math.max(start[0], end[0]) + 17, Math.max(start[1], end[1]) + 17, Math.max(start[2], end[2]) + 25];
+  for (const e of solids) {
+    if (e === ignore || e.removed) continue;
+    const mn = add(e.mins, e.offset), mx = add(e.maxs, e.offset);
+    if (mn[0] > hi[0] || mn[1] > hi[1] || mn[2] > hi[2] || mx[0] < lo[0] || mx[1] < lo[1] || mx[2] < lo[2]) continue;
+    const t = traceModel(e.head1, e.offset, start, end);
+    if (t.allsolid || t.startsolid || t.fraction < best.fraction) {
+      t.ent = e;
+      if (best.startsolid) { best = t; best.startsolid = true; } else best = t;
+    } else if (t.startsolid) best.startsolid = true;
+  }
+  return best;
+}
+const stuck = p => trace(p, p).startsolid;
+const hitsEnt = (e, org) => traceModel(e.head1, e.offset, org, org).startsolid;
+
+// ---------- game state ----------
+let time = 0, ents = [], world = null, events = [], P = null, M = null;
+const centerEl = document.getElementById('center'); let centerTimer = 0;
+function centerprint(msg) { centerEl.textContent = msg; centerEl.style.opacity = 1; clearTimeout(centerTimer); centerTimer = setTimeout(() => centerEl.style.opacity = 0, 2500); }
+function after(delay, fn) { events.push({ t: time + delay, fn }); }
+function think(e, delay, fn) { e.nextThink = time + delay; e.think = fn; }
+
+function movedir(angle) {
+  const a = +angle || 0;
+  if (a === -1) return [0, 0, 1];
+  if (a === -2) return [0, 0, -1];
+  const r = a * Math.PI / 180; return [Math.cos(r), Math.sin(r), 0];
+}
+function calcMove(e, dest, speed, done) { e.move = { dest, speed, done }; e.think = null; }
+
+// doors (doors.qc)
+const BOTTOM = 0, TOP = 1, UP = 2, DOWN = 3;
+function doorGoUp(d) {
+  if (d.state === UP) return;
+  if (d.state === TOP) { think(d, d.wait, () => doorGoDown(d)); return; }
+  d.state = UP; calcMove(d, d.pos2, d.speed, () => doorHitTop(d));
+}
+function doorHitTop(d) { d.state = TOP; if (d.toggle) return; if (d.wait >= 0) think(d, d.wait, () => doorGoDown(d)); }
+function doorGoDown(d) { d.state = DOWN; calcMove(d, d.pos1, d.speed, () => { d.state = BOTTOM; }); }
+function doorFire(m) {
+  if (m.toggle && (m.state === UP || m.state === TOP)) { for (const l of m.linked) doorGoDown(l); return; }
+  for (const l of m.linked) doorGoUp(l);
+}
+function doorUse(d) { doorFire(d.master); }
+function doorTouch(d) {
+  const m = d.master;
+  if (m.attackFinished > time) return;
+  m.attackFinished = time + 2;
+  if (m.message) centerprint(m.message);
+  if (!m.items) return;
+  if (!P.items[m.items]) { centerprint(`You need the ${m.items} key`); return; }
+  delete P.items[m.items]; updateStatus();
+  for (const l of m.linked) l.touch = null;
+  m.items = null; doorFire(m);
+}
+function doorBlocked(d) { if (d.wait >= 0) { if (d.state === DOWN) doorGoUp(d); else doorGoDown(d); } }
+
+// buttons (buttons.qc)
+function buttonFire(b) {
+  if (b.state === UP || b.state === TOP) return;
+  b.state = UP;
+  calcMove(b, b.pos2, b.speed, () => { b.state = TOP; think(b, b.wait, () => buttonReturn(b)); useTargets(b); });
+}
+function buttonReturn(b) { b.state = DOWN; calcMove(b, b.pos1, b.speed, () => { b.state = BOTTOM; }); }
+
+// secret doors (doors.qc fd_secret_*)
+function secretUse(s) {
+  if (s.busy) return;
+  s.busy = true;
+  calcMove(s, s.dest1, s.speed, () => think(s, 1, () => calcMove(s, s.dest2, s.speed, () => {
+    if (s.spawnflags & 1) return;   // OPEN_ONCE
+    think(s, s.wait, () => calcMove(s, s.dest1, s.speed, () => think(s, 1, () => calcMove(s, [0, 0, 0], s.speed, () => { s.busy = false; }))));
+  })));
+}
+
+function useTargets(e) {
+  const fire = () => {
+    if (e.message && e.kind !== 'door') centerprint(e.message);
+    if (e.killtarget) for (const t of ents) if (t.targetname === e.killtarget) { t.removed = true; if (t.mesh) t.mesh.visible = false; }
+    if (e.target) for (const t of ents) if (t.targetname === e.target && !t.removed && t.use) t.use(t);
+  };
+  if (e.delay > 0) after(e.delay, fire); else fire();
+}
+
+function shoot(e) {
+  if (e.kind === 'button' && e.health > 0) { buttonFire(e); return true; }
+  if (e.kind === 'door' && e.master.health > 0) { doorUse(e); return true; }
+  if (e.kind === 'secret' && e.shootable) { secretUse(e); return true; }
+  return false;
+}
+
+// ---------- building a map ----------
+const toThreeMesh = (geo, mats) => { const m = new THREE.Mesh(geo, mats); m.frustumCulled = false; return m; };
+function boxesTouch(aMin, aMax, bMin, bMax, pad = 0) {
+  return aMin[0] <= bMax[0] + pad && aMax[0] >= bMin[0] - pad && aMin[1] <= bMax[1] + pad && aMax[1] >= bMin[1] - pad && aMin[2] <= bMax[2] + pad && aMax[2] >= bMin[2] - pad;
+}
+
+async function show(name) {
+  if (!(window.QMAPS && QMAPS[name])) await loadScript(encodeURIComponent(name) + '.js?v=' + Date.now());   // always the newest data, never a cached copy
+  const m = QMAPS[name];
+  M = m;
+  for (const o of [...scene.children]) scene.remove(o);
+  const p = dec(m.pos, Float32Array);
+  for (let i = 0; i < p.length; i += 3) { const y = p[i + 1]; p[i + 1] = p[i + 2]; p[i + 2] = -y; }
+  const attrs = {
+    position: new THREE.BufferAttribute(p, 3), uv: new THREE.BufferAttribute(dec(m.uv, Float32Array), 2),
+    lmuv: new THREE.BufferAttribute(dec(m.lmuv, Float32Array), 2), shade: new THREE.BufferAttribute(dec(m.shade, Float32Array), 1),
+  };
+  const lm = await loader.loadAsync(m.lightmap);
+  lm.flipY = false; lm.colorSpace = THREE.NoColorSpace; lm.magFilter = lm.minFilter = THREE.LinearFilter; lm.generateMipmaps = false;
+  const mats = await Promise.all(m.textures.map(async t => {
+    let tex = grey, hasMap = 0;
+    if (t.url) {
+      tex = await loader.loadAsync(t.url);
+      tex.flipY = false; tex.colorSpace = THREE.NoColorSpace; tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestMipmapLinearFilter; hasMap = 1;
+    }
+    return new THREE.RawShaderMaterial({ vertexShader: VERT, fragmentShader: FRAG, side: THREE.DoubleSide,
+      uniforms: { map: { value: tex }, lightmap: { value: lm }, hasMap: { value: hasMap }, bright: brightU, holeMin: holeMinU, holeMax: holeMaxU } });
+  }));
+  const meshFor = model => {
+    const gs = m.groups[model]; if (!gs) return null;
+    const g = new THREE.BufferGeometry();
+    for (const k in attrs) g.setAttribute(k, attrs[k]);
+    for (const [start, count, mat] of gs) g.addGroup(start, count, mat);
+    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e6);
+    const mesh = toThreeMesh(g, mats); scene.add(mesh); return mesh;
+  };
+
+  C = { pl: dec(m.coll.planes, Float32Array), pt: dec(m.coll.ptype, Int32Array), clip: dec(m.coll.clip, Int32Array),
+        nodes: dec(m.coll.nodes, Int32Array), leafc: dec(m.coll.leafc, Int32Array), models: m.coll.models };
+  world = { mesh: meshFor(0) };
+  world.mesh.userData.ent = null;
+  buildMods(name, mats, lm);
+
+  // entities
+  time = 0; events = []; ents = []; solids = [];
+  for (const kv of m.entities) {
+    const cls = kv.classname;
+    const e = { classname: cls, kv, targetname: kv.targetname, target: kv.target, killtarget: kv.killtarget, message: kv.message,
+                delay: +kv.delay || 0, spawnflags: +kv.spawnflags || 0, offset: [0, 0, 0], removed: false };
+    if (kv.model && kv.model[0] === '*') {
+      const mi = +kv.model.slice(1), cm = C.models[mi];
+      if (!cm) continue;
+      Object.assign(e, { model: mi, mins: cm.mins, maxs: cm.maxs, head1: cm.head1, mesh: meshFor(mi) });
+      if (e.mesh) e.mesh.userData.ent = e;
+      const size = sub(cm.maxs, cm.mins);
+      const speed = +kv.speed || 100, md = movedir(kv.angle);
+      if (cls === 'func_door') {
+        const lip = kv.lip !== undefined ? +kv.lip : 8;
+        Object.assign(e, { kind: 'door', speed, wait: kv.wait !== undefined ? +kv.wait : 3, toggle: !!(e.spawnflags & 32), health: +kv.health || 0,
+          items: e.spawnflags & 8 ? 'gold' : e.spawnflags & 16 ? 'silver' : null, state: BOTTOM, pos1: [0, 0, 0],
+          pos2: scl(md, Math.abs(dot(md, size)) - lip), use: d => doorUse(d), touch: d => doorTouch(d), blocked: d => doorBlocked(d) });
+        if (e.items) e.wait = -1;
+        if (e.spawnflags & 1) { e.offset = e.pos2; [e.pos1, e.pos2] = [e.pos2, e.pos1]; }
+        solids.push(e);
+      } else if (cls === 'func_button') {
+        const lip = kv.lip !== undefined ? +kv.lip : 4;
+        Object.assign(e, { kind: 'button', speed: +kv.speed || 40, wait: kv.wait !== undefined ? +kv.wait || 1 : 1, health: +kv.health || 0,
+          state: BOTTOM, pos1: [0, 0, 0], pos2: scl(md, Math.abs(dot(md, size)) - lip), use: b => buttonFire(b) });
+        if (!e.health) e.touch = b => buttonFire(b);
+        solids.push(e);
+      } else if (cls === 'func_door_secret') {
+        const yaw = (+kv.angle || 0) * Math.PI / 180;
+        const fwd = [Math.cos(yaw), Math.sin(yaw), 0], right = [Math.sin(yaw), -Math.cos(yaw), 0], up = [0, 0, 1];
+        const width = e.spawnflags & 4 ? Math.abs(dot(up, size)) : Math.abs(dot(right, size));
+        const length = Math.abs(dot(fwd, size));
+        const dest1 = e.spawnflags & 4 ? scl(up, -width) : scl(right, width * (e.spawnflags & 2 ? -1 : 1));
+        Object.assign(e, { kind: 'secret', speed: +kv.speed || 50, wait: kv.wait !== undefined ? +kv.wait : 5, dest1, dest2: add(dest1, scl(fwd, length)),
+          shootable: !e.targetname || !!(e.spawnflags & 16), use: s => secretUse(s), attackFinished: 0,
+          touch: s => { if (s.message && s.attackFinished <= time) { s.attackFinished = time + 2; centerprint(s.message); } } });
+        solids.push(e);
+      } else if (cls.startsWith('trigger_')) {
+        Object.assign(e, { kind: 'trigger', wait: kv.wait !== undefined ? +kv.wait : 0.2, nextTouch: 0 });
+        if (cls === 'trigger_teleport') e.touchTrigger = t => teleport(t);
+        else if (cls === 'trigger_secret') { e.message = e.message || 'You found a secret area!'; e.touchTrigger = t => { useTargets(t); t.removed = true; }; }
+        else if (cls === 'trigger_once' || cls === 'trigger_multiple') e.touchTrigger = t => { useTargets(t); if (cls === 'trigger_once') t.removed = true; };
+        else if (cls === 'trigger_relay') e.use = t => useTargets(t);
+        if (e.mesh) e.mesh.visible = false;
+      } else if (cls === 'func_illusionary') {
+        e.kind = 'illusion';
+      } else {
+        e.kind = 'wall'; solids.push(e);   // func_wall, func_plat and anything else: solid and still
+      }
+    } else if (cls === 'trigger_relay') {
+      Object.assign(e, { kind: 'relay', use: t => useTargets(t) });
+    } else if (cls.startsWith('item_')) {
+      const org = vec(kv.origin);
+      if (cls === 'item_key2' || cls.includes('envirosuit')) {   // these sit high up: halve their height so they can be reached without a jump
+        let z = org[2]; while (z > org[2] - 1000 && pointContents([org[0], org[1], z]) !== SOLID) z--;
+        org[2] = Math.round(z + (org[2] - z) / 2);
+      }
+      const look = cls === 'item_key2' ? [0xd8b030, 'gold key', 'gold'] : cls === 'item_key1' ? [0xc0c0d0, 'silver key', 'silver']
+                 : cls.includes('envirosuit') ? [0x50c050, 'Biosuit'] : cls.includes('invisibility') ? [0xc04040, 'Ring of Shadows']
+                 : cls.includes('invulnerability') ? [0xd04040, 'Pentagram of Protection'] : cls.includes('super_damage') ? [0x6060ff, 'Quad Damage']
+                 : cls.includes('health') ? [0xd06060, 'health'] : [0xb0a080, cls.replace(/^item_/, '').replace(/_/g, ' ')];
+      const mesh = new THREE.Mesh(new THREE.OctahedronGeometry(9), new THREE.MeshBasicMaterial({ color: look[0] }));
+      mesh.add(new THREE.Mesh(new THREE.OctahedronGeometry(9.5), new THREE.MeshBasicMaterial({ color: 0x000000, wireframe: true })));
+      mesh.position.copy(q2t(add(org, [0, 0, 16]))); scene.add(mesh);
+      Object.assign(e, { kind: 'item', origin: org, mesh, name: look[1], key: look[2], mins: add(org, [-16, -16, -24]), maxs: add(org, [16, 16, 32]) });
+    } else if (cls === 'info_teleport_destination') {
+      Object.assign(e, { kind: 'dest', origin: add(vec(kv.origin), [0, 0, 27]), yaw: +kv.angle || 0 });
+    } else continue;
+    ents.push(e);
+  }
+
+  // link touching doors (LinkDoors) and give unnamed doors their approach trigger
+  const doors = ents.filter(e => e.kind === 'door');
+  for (const d of doors) d.master = null;
+  for (const d of doors) {
+    if (d.master) continue;
+    d.master = d; d.linked = [d];
+    if (d.spawnflags & 4) continue;   // DONT_LINK
+    for (let i = 0; i < d.linked.length; i++) {
+      const a = d.linked[i];
+      for (const b of doors) if (!b.master && !(b.spawnflags & 4) && boxesTouch(a.mins, a.maxs, b.mins, b.maxs)) { b.master = d; d.linked.push(b); }
+    }
+  }
+  for (const d of doors) if (d.master === d) {
+    for (const l of d.linked) {
+      if (l.health) d.health = l.health;
+      if (l.targetname) d.targetname = d.targetname || l.targetname;
+      if (l.message) d.message = l.message;
+      if (l.items) d.items = l.items;
+    }
+    d.attackFinished = 0;
+    if (d.health || d.targetname || d.items) continue;
+    let mn = d.mins.slice(), mx = d.maxs.slice();
+    for (const l of d.linked) for (let k = 0; k < 3; k++) { mn[k] = Math.min(mn[k], l.mins[k]); mx[k] = Math.max(mx[k], l.maxs[k]); }
+    ents.push({ kind: 'field', door: d, mins: sub(mn, [60, 60, 8]), maxs: add(mx, [60, 60, 8]), nextTouch: 0, offset: [0, 0, 0],
+      touchTrigger: f => { if (f.door.state !== TOP && f.door.state !== UP && f.door.message) centerprint(f.door.message); doorUse(f.door); } });
+  }
+
+  spawnPlayer();
+  document.getElementById('info').textContent = m.triangles.toLocaleString() + ' triangles';
+}
+
+function buildMods(name, mats, lm) {
+  const md = MAP_MODS[name];
+  carve = null; boxes = [];
+  holeMinU.value.set(1e9, 1e9, 1e9); holeMaxU.value.set(1e9, 1e9, 1e9);
+  if (!md) return;
+  const quads = [];   // [corner a, b, c, d] in Quake coordinates
+  if (md.doorway) {
+    const a = md.doorway.min, b = md.doorway.max;
+    holeMinU.value.set(a[0] + 0.01, a[1] - 0.5, a[2] + 0.5); holeMaxU.value.set(b[0] - 0.01, b[1] + 0.5, b[2] - 0.01);
+    carve = { min: [a[0] + 16, a[1] - 24, a[2] + 24], max: [b[0] - 16, b[1] + 24, b[2] - 32] };
+    quads.push([[a[0], a[1], a[2]], [a[0], b[1], a[2]], [a[0], b[1], b[2]], [a[0], a[1], b[2]]],    // left side
+               [[b[0], a[1], a[2]], [b[0], b[1], a[2]], [b[0], b[1], b[2]], [b[0], a[1], b[2]]],    // right side
+               [[a[0], a[1], b[2]], [b[0], a[1], b[2]], [b[0], b[1], b[2]], [a[0], b[1], b[2]]],    // top
+               [[a[0], a[1], a[2]], [b[0], a[1], a[2]], [b[0], b[1], a[2]], [a[0], b[1], a[2]]]);   // sill
+  }
+  for (const st of md.steps || []) {
+    const a = st.min, b = st.max;
+    boxes.push({ min: sub(a, PMAXS), max: sub(b, PMINS) });
+    quads.push([[a[0], a[1], b[2]], [b[0], a[1], b[2]], [b[0], b[1], b[2]], [a[0], b[1], b[2]]],    // top
+               [[a[0], b[1], a[2]], [b[0], b[1], a[2]], [b[0], b[1], b[2]], [a[0], b[1], b[2]]],    // front
+               [[a[0], a[1], a[2]], [a[0], b[1], a[2]], [a[0], b[1], b[2]], [a[0], a[1], b[2]]],    // left
+               [[b[0], a[1], a[2]], [b[0], b[1], a[2]], [b[0], b[1], b[2]], [b[0], a[1], b[2]]]);   // right
+  }
+  // use the texture of the wall being cut: find it with a ray from the loft side
+  let mat = mats[0];
+  if (md.doorway) {
+    const a = md.doorway.min, b = md.doorway.max, c = [(a[0] + b[0]) / 2, b[1] + 30, (a[2] + b[2]) / 2];
+    const r = new THREE.Raycaster(q2t(c), q2t([0, -1, 0]).normalize());
+    const hit = r.intersectObject(world.mesh, false)[0];
+    if (hit && hit.face && mats[hit.face.materialIndex]) mat = mats[hit.face.materialIndex];
+  }
+  const pos = [], uv = [], lmuv = [], shade = [];
+  const lmv = [1 / lm.image.width, 1 / lm.image.height];
+  for (const q of quads) {
+    const n = cross(sub(q[1], q[0]), sub(q[3], q[0])), ax = Math.abs(n[0]) > 0.5 ? 0 : Math.abs(n[1]) > 0.5 ? 1 : 2;
+    const [u, v] = ax === 0 ? [1, 2] : ax === 1 ? [0, 2] : [0, 1];
+    for (const k of [0, 1, 2, 0, 2, 3]) {
+      const t = q2t(q[k]); pos.push(t.x, t.y, t.z);
+      uv.push(q[k][u] / 64, -q[k][v] / 64); lmuv.push(...lmv); shade.push(ax === 2 ? 1 : 0.8);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('lmuv', new THREE.Float32BufferAttribute(lmuv, 2));
+  g.setAttribute('shade', new THREE.Float32BufferAttribute(shade, 1));
+  const m2 = new THREE.RawShaderMaterial({ vertexShader: VERT, fragmentShader: FRAG, side: THREE.DoubleSide,
+    uniforms: { map: mat.uniforms.map, lightmap: { value: lm }, hasMap: mat.uniforms.hasMap, bright: brightU,
+                holeMin: { value: new THREE.Vector3(1e9, 1e9, 1e9) }, holeMax: { value: new THREE.Vector3(1e9, 1e9, 1e9) } } });
+  scene.add(toThreeMesh(g, m2));
+}
+
+function teleport(t) {
+  const dests = ents.filter(e => e.kind === 'dest');
+  const d = dests.find(e => e.kv.targetname && e.kv.targetname === t.target) || dests[0];
+  if (!d) return;
+  P.org = d.origin.slice(); P.yaw = (d.yaw - 90) * Math.PI / 180; P.pitch = 0;
+  const r = d.yaw * Math.PI / 180; P.vel = [Math.cos(r) * 300, Math.sin(r) * 300, 0];
+}
+
+// ---------- player ----------
+function spawnPlayer() {
+  const s = M.spawn;
+  P = { org: add(s.slice(0, 3), [0, 0, 1]), vel: [0, 0, 0], yaw: (s[3] - 90) * Math.PI / 180, pitch: 0, ground: null,
+        noclip: false, items: {}, jumpReleased: true, waterlevel: 0, watertype: EMPTY };
+  for (let i = 0; i < 64 && stuck(P.org); i++) P.org[2] += 4;
+  updateStatus();
+}
+function updateStatus() {
+  const k = Object.keys(P.items).map(x => x + ' key');
+  document.getElementById('status').textContent = (P.noclip ? 'NOCLIP  ' : '') + (k.length ? 'Keys: ' + k.join(', ') : 'No keys');
+}
+
+const keys = {};
+addEventListener('keydown', e => {
+  if (e.repeat) return;
+  keys[e.code] = true;
+  if (e.code === 'KeyR') spawnPlayer();
+  if (e.code === 'KeyP') {   // where am I? (to tell Claude where to change the map)
+    const yawDeg = Math.round(((P.yaw * 180 / Math.PI) + 90 + 360) % 360);
+    const txt = `position ${P.org.map(Math.round).join(' ')} facing ${yawDeg}`;
+    centerprint(txt); try { navigator.clipboard.writeText(txt); } catch (err) {}
+  }
+  if (e.code === 'KeyN') { P.noclip = !P.noclip; P.vel = [0, 0, 0]; centerprint(P.noclip ? 'noclip ON' : 'noclip OFF'); updateStatus(); }
+  if (e.code === 'Space') e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+const canvas = renderer.domElement;
+canvas.addEventListener('mousedown', e => {
+  if (document.pointerLockElement !== canvas) { canvas.requestPointerLock(); return; }
+  if (e.button === 0) fire();
+});
+document.addEventListener('pointerlockchange', () => {
+  const on = document.pointerLockElement === canvas;
+  document.getElementById('play').style.display = on ? 'none' : 'flex';
+  document.getElementById('cross').style.display = on ? 'block' : 'none';
+});
+document.addEventListener('mousemove', e => {
+  if (document.pointerLockElement !== canvas || !P) return;
+  P.yaw -= e.movementX * 0.0022; P.pitch = Math.max(-1.5, Math.min(1.5, P.pitch - e.movementY * 0.0022));
+});
+const ray = new THREE.Raycaster();
+function fire() {
+  ray.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const targets = [world.mesh, ...ents.filter(e => e.mesh && !e.removed && e.kind !== 'trigger' && e.kind !== 'item').map(e => e.mesh)];
+  const hit = ray.intersectObjects(targets, false)[0];
+  if (hit && hit.object.userData.ent) shoot(hit.object.userData.ent);
+}
+
+// Quake movement (sv_user.c / sv_phys.c), run at 72 ticks a second like the original server.
+// FRICTION is 8 (Quake's is 4) so you stop quickly instead of sliding; STEP is 24 (Quake's is 18) so you walk up
+// the 20-unit steps onto the lift and at the back door; the rest are Quake's own values.
+const GRAVITY = 800, MAXSPEED = 320, FRICTION = 8, STOPSPEED = 100, ACCEL = 10, STEP = 24, JUMP = 270, VIEW_HEIGHT = 30;
+function clipVelocity(v, n) {
+  const b = dot(v, n), o = sub(v, scl(n, b));
+  for (let i = 0; i < 3; i++) if (Math.abs(o[i]) < 0.1) o[i] = 0;
+  return o;
+}
+function flyMove(dt) {
+  const planes = []; let blocked = 0, timeLeft = dt;
+  const primal = P.vel.slice(); let original = P.vel.slice();
+  for (let bump = 0; bump < 4; bump++) {
+    if (!P.vel[0] && !P.vel[1] && !P.vel[2]) break;
+    const end = add(P.org, scl(P.vel, timeLeft));
+    const tr = trace(P.org, end);
+    if (tr.allsolid) { P.vel = [0, 0, 0]; return 3; }
+    if (tr.fraction > 0) { P.org = tr.endpos; original = P.vel.slice(); planes.length = 0; }
+    if (tr.fraction === 1) break;
+    if (tr.ent && tr.ent.touch) tr.ent.touch(tr.ent);
+    if (tr.normal[2] > 0.7) { blocked |= 1; P.ground = tr.ent || 'world'; }
+    if (!tr.normal[2]) blocked |= 2;
+    timeLeft -= timeLeft * tr.fraction;
+    planes.push(tr.normal);
+    let i, nv;
+    for (i = 0; i < planes.length; i++) {
+      nv = clipVelocity(original, planes[i]);
+      let j; for (j = 0; j < planes.length; j++) if (j !== i && dot(nv, planes[j]) < 0) break;
+      if (j === planes.length) break;
+    }
+    if (i !== planes.length) P.vel = nv;
+    else {
+      if (planes.length !== 2) { P.vel = [0, 0, 0]; return 7; }
+      const dir = cross(planes[0], planes[1]); P.vel = scl(dir, dot(dir, P.vel));
+    }
+    if (dot(P.vel, primal) <= 0) { P.vel = [0, 0, 0]; return blocked; }
+  }
+  return blocked;
+}
+function walkMove(dt) {
+  const oldOnGround = !!P.ground, oldOrg = P.org.slice(), oldVel = P.vel.slice();
+  const clip = flyMove(dt);
+  if (!(clip & 2)) return;
+  if (!oldOnGround && P.waterlevel === 0) return;
+  const noStepOrg = P.org.slice(), noStepVel = P.vel.slice(), noStepGround = P.ground;
+  P.org = oldOrg;
+  P.org = trace(P.org, add(P.org, [0, 0, STEP])).endpos;
+  P.vel = [oldVel[0], oldVel[1], 0];
+  flyMove(dt);
+  const down = trace(P.org, add(P.org, [0, 0, -STEP + oldVel[2] * dt]));
+  if (down.normal && down.normal[2] > 0.7 && !down.allsolid) { P.org = down.endpos; P.ground = down.ent || 'world'; P.vel[2] = 0; }
+  else { P.org = noStepOrg; P.vel = noStepVel; P.ground = noStepGround; }
+}
+function waterLevel() {
+  const feet = pointContents(add(P.org, [0, 0, PMINS[2] + 1]));
+  P.waterlevel = 0; P.watertype = EMPTY;
+  if (feet <= WATER && feet >= LAVA) {
+    P.watertype = feet; P.waterlevel = 1;
+    const waist = pointContents(P.org);
+    if (waist <= WATER && waist >= LAVA) { P.waterlevel = 2; const eyes = pointContents(add(P.org, [0, 0, 22])); if (eyes <= WATER && eyes >= LAVA) P.waterlevel = 3; }
+  }
+}
+function playerTick(dt) {
+  const fwdYaw = P.yaw + Math.PI / 2;
+  const fwd = [Math.cos(fwdYaw), Math.sin(fwdYaw), 0], right = [Math.sin(fwdYaw), -Math.cos(fwdYaw), 0];
+  const cp = Math.cos(P.pitch), fwd3 = [fwd[0] * cp, fwd[1] * cp, Math.sin(P.pitch)];
+  const speed = keys.ShiftLeft || keys.ShiftRight ? 160 : MAXSPEED;
+  const fm = ((keys.KeyW || keys.ArrowUp) ? 1 : 0) - ((keys.KeyS || keys.ArrowDown) ? 1 : 0);
+  const sm = ((keys.KeyD || keys.ArrowRight) ? 1 : 0) - ((keys.KeyA || keys.ArrowLeft) ? 1 : 0);
+
+  if (P.noclip) {
+    const um = (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ ? 1 : 0);
+    const v = add(add(scl(fwd3, fm), scl(right, sm)), [0, 0, um]);
+    P.org = add(P.org, scl(v, (keys.ShiftLeft ? 900 : 450) * dt));
+    return;
+  }
+  waterLevel();
+  if (P.waterlevel >= 2) {                         // swimming (SV_WaterMove)
+    let wish = add(scl(fwd3, fm * speed), scl(right, sm * speed));
+    if (keys.Space) wish[2] += speed; else if (!fm && !sm) wish[2] -= 60;
+    const ws = Math.min(len(wish), MAXSPEED) * 0.7;
+    const sp = len(P.vel);
+    if (sp) { const ns = Math.max(0, sp - dt * sp * FRICTION); P.vel = scl(P.vel, ns / sp); }
+    if (ws) {
+      const wd = scl(wish, 1 / len(wish)), addsp = ws - dot(P.vel, wd);
+      if (addsp > 0) P.vel = add(P.vel, scl(wd, Math.min(ACCEL * ws * dt, addsp)));
+    }
+    P.ground = null; flyMove(dt); return;
+  }
+  // ground check
+  const g = trace(P.org, add(P.org, [0, 0, -1]));
+  P.ground = g.fraction < 1 && g.normal && g.normal[2] > 0.7 && !g.startsolid ? (g.ent || 'world') : null;
+  if (P.ground && P.vel[2] < 0) P.vel[2] = 0;
+  if (!keys.Space) P.jumpReleased = true;
+  if (keys.Space && P.ground && P.jumpReleased) { P.vel[2] = JUMP; P.ground = null; P.jumpReleased = false; }
+  const wish = add(scl(fwd, fm * speed), scl(right, sm * speed));
+  let ws = len(wish); const wd = ws ? scl(wish, 1 / ws) : [0, 0, 0]; ws = Math.min(ws, MAXSPEED);
+  if (P.ground) {                                  // SV_UserFriction + SV_Accelerate
+    const sp = Math.hypot(P.vel[0], P.vel[1]);
+    if (sp) { const ctl = Math.max(sp, STOPSPEED), ns = Math.max(0, sp - dt * ctl * FRICTION); P.vel[0] *= ns / sp; P.vel[1] *= ns / sp; }
+    const addsp = ws - dot(P.vel, wd);
+    if (addsp > 0) P.vel = add(P.vel, scl(wd, Math.min(ACCEL * dt * ws, addsp)));
+  } else {                                         // SV_AirAccelerate
+    const addsp = Math.min(ws, 30) - dot(P.vel, wd);
+    if (addsp > 0) P.vel = add(P.vel, scl(wd, Math.min(ACCEL * ws * dt, addsp)));
+    P.vel[2] -= GRAVITY * dt;
+  }
+  walkMove(dt);
+  const g2 = trace(P.org, add(P.org, [0, 0, -1]));
+  P.ground = g2.fraction < 1 && g2.normal && g2.normal[2] > 0.7 && !g2.startsolid ? (g2.ent || 'world') : null;
+}
+
+// movers push the player (SV_PushMove); blocked movers reverse like Quake doors
+function moverTick(e, dt) {
+  const mv = e.move; if (!mv) return;
+  const delta = sub(mv.dest, e.offset), dist = len(delta);
+  const stepLen = mv.speed * dt;
+  const step = dist <= stepLen ? delta : scl(delta, stepLen / dist);
+  const old = e.offset;
+  e.offset = add(e.offset, step);
+  if (!P.noclip) {
+    const riding = P.ground === e;
+    const inside = hitsEnt(e, P.org);
+    if (riding || inside) {
+      const moved = add(P.org, step);
+      // a rider resting exactly on the surface can end up a fraction inside: lift it clear, as the engine's push does
+      for (let k = 0; k < 6 && step[2] >= 0 && hitsEnt(e, moved); k++) moved[2] += 0.5;
+      e.removed = true; const blockedByOthers = stuck(moved); e.removed = false;
+      const stillInside = hitsEnt(e, moved);
+      if (blockedByOthers || stillInside) {
+        e.offset = old;
+        if (e.blocked) e.blocked(e);
+        return;
+      }
+      P.org = moved;
+    }
+  }
+  if (dist <= stepLen) { e.move = null; mv.done && mv.done(); }
+}
+
+function triggersTick() {
+  if (P.noclip) return;
+  const pmn = add(P.org, PMINS), pmx = add(P.org, PMAXS);
+  for (const e of ents) {
+    if (e.removed) continue;
+    if (e.kind === 'item') {
+      e.mesh.rotation.y = time * 2;
+      if (boxesTouch(pmn, pmx, e.mins, e.maxs)) {
+        e.removed = true; e.mesh.visible = false;
+        if (e.key) P.items[e.key] = true;
+        centerprint('You got the ' + e.name); updateStatus();
+      }
+    } else if (e.touchTrigger && (e.kind === 'trigger' || e.kind === 'field')) {
+      if (time < e.nextTouch) continue;
+      if (boxesTouch(pmn, pmx, e.mins, e.maxs)) { e.nextTouch = time + (e.kind === 'field' ? 1 : e.wait); e.touchTrigger(e); }
+    } else if (e.touch && (e.kind === 'door' || e.kind === 'button' || e.kind === 'secret')) {
+      // standing right against a solid brush entity counts as touching it
+      const mn = add(e.mins, e.offset), mx = add(e.maxs, e.offset);
+      if (boxesTouch(pmn, pmx, mn, mx, 1) && !boxesTouch(pmn, pmx, mn, mx, -1)) e.touch(e);
+    }
+  }
+}
+
+function gameTick(dt) {
+  time += dt;
+  for (const e of ents) if (e.think && e.nextThink <= time) { const f = e.think; e.think = null; f(); }
+  const due = events.filter(ev => ev.t <= time); events = events.filter(ev => ev.t > time);
+  for (const ev of due) ev.fn();
+  playerTick(dt);
+  for (const e of ents) if (e.move) moverTick(e, dt);
+  triggersTick();
+  if (P.org[2] < C.models[0].mins[2] - 1000) { centerprint('You fell out of the world'); spawnPlayer(); }
+}
+
+// ---------- main loop ----------
+const tint = document.getElementById('tint');
+const clock = new THREE.Clock();
+let acc = 0;
+const TICK = 1 / 72;
+renderer.setAnimationLoop(() => {
+  if (!P || !world) return;
+  acc += Math.min(clock.getDelta(), 0.1);
+  while (acc >= TICK) { gameTick(TICK); acc -= TICK; }
+  for (const e of ents) if (e.mesh && e.model !== undefined) e.mesh.position.copy(q2t(e.offset));
+  const eye = add(P.org, [0, 0, VIEW_HEIGHT]);
+  camera.position.copy(q2t(eye));
+  camera.rotation.set(P.pitch, P.yaw, 0);
+  const c = pointContents(eye);
+  const col = c === WATER ? 'rgba(40,80,140,0.35)' : c === SLIME ? 'rgba(40,140,40,0.4)' : c === LAVA ? 'rgba(200,70,10,0.45)' : null;
+  tint.style.opacity = col ? 1 : 0; if (col) tint.style.background = col;
+  renderer.render(scene, camera);
+});
+
+// beak8v is the most developed version of the house; the older builds' data files stay in this folder unused
+// (open viewer.html?map=house7gi, for example, to look at one).
+show(new URLSearchParams(location.search).get('map') || 'beak8v');
+window.__qmv = { get P() { return P; }, get ents() { return ents; }, trace, shoot, keys, pointContents, get time() { return time; } };
+</script>
+</body>
+</html>
