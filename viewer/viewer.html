@@ -31,7 +31,6 @@
   <p style="margin-top:0">beak8v &middot; 1 Nov 1997 &middot; <span id="info"></span></p>
   <p>Ported with Claude Code so quake map is rendered in the browser with javascript.</p>
   <p><b>Technologies:</b> JavaScript, three.js (WebGL) and GLSL shaders, Quake BSP collision hulls and movement ported to JavaScript, Python (map converter: geometry, textures with the Quake palette, baked lightmaps), GitHub Pages.</p>
-  <p><label>Brightness <input id="bright" type="range" min="0.6" max="2" step="0.05" value="1.25"></label></p>
   <p><label><input id="simple" type="checkbox"> Simple graphics (faster, chunky 1990s pixels)</label></p>
   <p>Click to play &middot; mouse to look &middot; <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &middot; <kbd>Space</kbd> jump / swim up &middot; <kbd>Shift</kbd> walk &middot;
      <b>click</b> to shoot (some buttons and doors are shot, like in Quake) &middot; <kbd>N</kbd> noclip (fly, <kbd>Q</kbd>/<kbd>E</kbd> down/up) &middot; <kbd>R</kbd> restart &middot; <kbd>P</kbd> copy your position &middot; <kbd>Esc</kbd> free the mouse</p>
@@ -47,8 +46,8 @@ import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.m
 // ---------- rendering setup ----------
 // Simple graphics: draw about 640 pixels across and scale up without smoothing (faster, and chunky like 1990s Quake).
 // Antialiasing can only be chosen when the renderer is made, so that part of a change applies on the next visit.
-let simple = false;
-try { simple = localStorage.getItem('qmv-simple') === '1'; } catch (e) {}
+let simple = true;   // on unless the viewer has turned it off
+try { simple = localStorage.getItem('qmv-simple') !== '0'; } catch (e) { simple = true; }
 const renderer = new THREE.WebGLRenderer({ antialias: !simple });
 const applyGraphics = () => {
   renderer.setPixelRatio(simple ? Math.min(1, 640 / innerWidth) : Math.min(devicePixelRatio, 2));
@@ -89,7 +88,7 @@ void main() {
   vec4 tx = hasMap > 0.5 ? texture2D(map, vUv) : vec4(0.55, 0.55, 0.55, 0.0);
   gl_FragColor = vec4(mix(t * min(light, 2.2) * vShade, tx.rgb * 1.1, tx.a), 1.0);
 }`;
-const brightU = { value: 1.25 };
+const brightU = { value: 1 };
 const holeMinU = { value: new THREE.Vector3(1e9, 1e9, 1e9) }, holeMaxU = { value: new THREE.Vector3(1e9, 1e9, 1e9) };
 
 // Changes to the original map. beak8v: a doorway from the loft onto the flat roof (the roof is 28 units above
@@ -97,10 +96,6 @@ const holeMinU = { value: new THREE.Vector3(1e9, 1e9, 1e9) }, holeMaxU = { value
 const MAP_MODS = {
   beak8v: { doorway: { min: [-45, 17, 90], max: [3, 27, 162] }, steps: [{ min: [-45, 27, 62], max: [3, 43, 76] }] },
 };
-const brightEl = document.getElementById('bright');
-try { const b = localStorage.getItem('qmv-bright'); if (b) brightEl.value = b; } catch (e) {}
-brightU.value = +brightEl.value;
-brightEl.oninput = () => { brightU.value = +brightEl.value; try { localStorage.setItem('qmv-bright', brightEl.value); } catch (e) {} };
 const simpleEl = document.getElementById('simple');
 simpleEl.checked = simple;
 simpleEl.onchange = () => {
