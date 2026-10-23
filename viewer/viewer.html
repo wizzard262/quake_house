@@ -8,6 +8,7 @@
   :root { --bg: #0b0b0d; --panel: rgba(20, 20, 24, 0.82); --text: #e8e4dc; --muted: #a39d92; --accent: #c8752e; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
   canvas { display: block; }
+  canvas.simple { image-rendering: pixelated; }
   #hud { position: fixed; top: 12px; left: 12px; background: var(--panel); padding: 10px 14px; border-radius: 8px; max-width: 330px; }
   #hud h1 { font-size: 15px; margin: 0 0 6px; color: var(--accent); letter-spacing: 0.04em; }
   #hud select { background: #222; color: var(--text); border: 1px solid #444; border-radius: 4px; padding: 3px 6px; }
@@ -31,6 +32,7 @@
   <p>Ported with Claude Code so quake map is rendered in the browser with javascript.</p>
   <p><b>Technologies:</b> JavaScript, three.js (WebGL) and GLSL shaders, Quake BSP collision hulls and movement ported to JavaScript, Python (map converter: geometry, textures with the Quake palette, baked lightmaps), GitHub Pages.</p>
   <p><label>Brightness <input id="bright" type="range" min="0.6" max="2" step="0.05" value="1.25"></label></p>
+  <p><label><input id="simple" type="checkbox"> Simple graphics (faster, chunky 1990s pixels)</label></p>
   <p>Click to play &middot; mouse to look &middot; <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &middot; <kbd>Space</kbd> jump / swim up &middot; <kbd>Shift</kbd> walk &middot;
      <b>click</b> to shoot (some buttons and doors are shot, like in Quake) &middot; <kbd>N</kbd> noclip (fly, <kbd>Q</kbd>/<kbd>E</kbd> down/up) &middot; <kbd>R</kbd> restart &middot; <kbd>P</kbd> copy your position &middot; <kbd>Esc</kbd> free the mouse</p>
 </div>
@@ -43,15 +45,23 @@
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 
 // ---------- rendering setup ----------
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.setSize(innerWidth, innerHeight);
+// Simple graphics: draw about 640 pixels across and scale up without smoothing (faster, and chunky like 1990s Quake).
+// Antialiasing can only be chosen when the renderer is made, so that part of a change applies on the next visit.
+let simple = false;
+try { simple = localStorage.getItem('qmv-simple') === '1'; } catch (e) {}
+const renderer = new THREE.WebGLRenderer({ antialias: !simple });
+const applyGraphics = () => {
+  renderer.setPixelRatio(simple ? Math.min(1, 640 / innerWidth) : Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.domElement.classList.toggle('simple', simple);
+};
+applyGraphics();
 document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0b0d);
 const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 1, 20000);
 camera.rotation.order = 'YXZ';
-addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); applyGraphics(); });
 
 const dec = (b64, T) => { const s = atob(b64), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return new T(u.buffer); };
 const loadScript = src => new Promise((ok, fail) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = fail; document.body.appendChild(s); });
@@ -91,6 +101,12 @@ const brightEl = document.getElementById('bright');
 try { const b = localStorage.getItem('qmv-bright'); if (b) brightEl.value = b; } catch (e) {}
 brightU.value = +brightEl.value;
 brightEl.oninput = () => { brightU.value = +brightEl.value; try { localStorage.setItem('qmv-bright', brightEl.value); } catch (e) {} };
+const simpleEl = document.getElementById('simple');
+simpleEl.checked = simple;
+simpleEl.onchange = () => {
+  simple = simpleEl.checked; applyGraphics(); simpleEl.blur();   // blur so Space (jump) doesn't toggle it
+  try { localStorage.setItem('qmv-simple', simple ? '1' : '0'); } catch (e) {}
+};
 const loader = new THREE.TextureLoader();
 const grey = new THREE.DataTexture(new Uint8Array([140, 140, 140, 255]), 1, 1); grey.needsUpdate = true;
 
