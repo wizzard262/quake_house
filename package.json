@@ -1,0 +1,11 @@
+{
+  "name": "quake_house",
+  "private": true,
+  "description": "Quake Map - My House: tests for the browser viewer",
+  "scripts": {
+    "test": "node tests/game.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.60.0"
+  }
+}

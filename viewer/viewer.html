@@ -31,6 +31,7 @@
   <p style="margin-top:0">beak8v &middot; 1 Nov 1997 &middot; <span id="info"></span></p>
   <p>Ported with Claude Code so quake map is rendered in the browser with javascript.</p>
   <p><b>Technologies:</b> JavaScript, three.js (WebGL) and GLSL shaders, Quake BSP collision hulls and movement ported to JavaScript, Python (map converter: geometry, textures with the Quake palette, baked lightmaps), GitHub Pages.</p>
+  <p><b>Goal:</b> find the golden cup in the bathroom. The bathroom is locked from the landing, so find another way in.</p>
   <p><label><input id="simple" type="checkbox"> Simple graphics (faster, chunky 1990s pixels)</label></p>
   <p>Click to play &middot; mouse to look &middot; <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move &middot; <kbd>Space</kbd> jump / swim up &middot; <kbd>Shift</kbd> walk &middot;
      <b>click</b> to shoot (some buttons and doors are shot, like in Quake) &middot; <kbd>N</kbd> noclip (fly, <kbd>Q</kbd>/<kbd>E</kbd> down/up) &middot; <kbd>R</kbd> restart &middot; <kbd>P</kbd> copy your position &middot; <kbd>Esc</kbd> free the mouse</p>
@@ -77,25 +78,48 @@ void main() {
 }`;
 // Quake-style texture x baked light; a gentle curve lifts dark interiors more than lit areas.
 const FRAG = `precision highp float;
-uniform sampler2D map; uniform sampler2D lightmap; uniform float hasMap; uniform float bright;
+uniform sampler2D map; uniform sampler2D lightmap; uniform float hasMap; uniform float bright; uniform float silver;
 uniform vec3 holeMin; uniform vec3 holeMax;
 varying vec2 vUv; varying vec2 vLm; varying float vShade; varying vec3 vQ;
+// greys a colour with a cool tint: turns the gold key logo silver
+vec3 silvered(vec3 c) { float g = dot(c, vec3(0.299, 0.587, 0.114)); return vec3(0.93, 0.97, 1.05) * g * 1.2; }
 void main() {
   if (all(greaterThan(vQ, holeMin)) && all(lessThan(vQ, holeMax))) discard;   // a doorway cut through a wall
-  vec3 t = hasMap > 0.5 ? texture2D(map, vUv).rgb : vec3(0.55);
+  vec4 tx = hasMap > 0.5 ? texture2D(map, vUv) : vec4(0.55, 0.55, 0.55, 0.0);
+  vec3 t = silver > 0.5 ? silvered(tx.rgb) : tx.rgb;
   float l = texture2D(lightmap, vLm).r;
   float light = 2.0 * pow(clamp(l, 0.0, 1.0), 0.6) * bright + 0.06;
-  vec4 tx = hasMap > 0.5 ? texture2D(map, vUv) : vec4(0.55, 0.55, 0.55, 0.0);
-  gl_FragColor = vec4(mix(t * min(light, 2.2) * vShade, tx.rgb * 1.1, tx.a), 1.0);
+  gl_FragColor = vec4(mix(t * min(light, 2.2) * vShade, t * 1.1, tx.a), 1.0);
 }`;
 const brightU = { value: 1 };
 const holeMinU = { value: new THREE.Vector3(1e9, 1e9, 1e9) }, holeMaxU = { value: new THREE.Vector3(1e9, 1e9, 1e9) };
+const noHole = () => ({ value: new THREE.Vector3(1e9, 1e9, 1e9) });
 
-// Changes to the original map. beak8v: a doorway from the loft onto the flat roof (the roof is 28 units above
-// the loft floor, so a 14-unit step inside and a 14-unit sill make it walkable).
+// Changes to the original map (model numbers are the map's brush models, *N in the entity list).
+// beak8v:
+// - a doorway from the loft onto the flat roof (the roof is 28 units above the loft floor, so a 14-unit step
+//   inside and a 14-unit sill make it walkable)
+// - the keys: the gold key is now the silver key and opens the bedroom (its key logo turns silver); the biosuit
+//   is now the gold key and opens the downstairs cupboard (which shows the gold key logo) and works the lift
+// - the bedroom door shuts again once unlocked, so it no longer stands up in the loft doorway
+// - the bathroom door opens only from inside (you get in by dropping through the hole in the loft floor)
+// - the goal: a golden cup in the bathroom
 const MAP_MODS = {
-  beak8v: { doorway: { min: [-45, 17, 90], max: [3, 27, 162] }, steps: [{ min: [-45, 27, 62], max: [3, 43, 76] }] },
+  beak8v: {
+    doorway: { min: [-45, 17, 90], max: [3, 27, 162] }, steps: [{ min: [-45, 27, 62], max: [3, 43, 76] }],
+    pickups: { item_key2: 'silver', item_artifact_envirosuit: 'gold' },   // item classname -> the key it gives
+    doorKeys: { 3: 'silver' },                                           // bedroom door
+    silverTextures: ['key03_2'],                                         // the bedroom door's key logo
+    buttonKeys: { 24: 'gold', 27: 'gold' },                              // cupboard button, lift button
+    // the gold key logo on the outer face of both cupboard doors, cut like the bedroom door's logo (u and v
+    // ranges copied from that face, so it looks the same, at half the size)
+    keyLogos: [{ models: [22, 23], texture: 'key03_2', size: [26, 58], u: [-0.042, 1.042], v: [1.05, 2.057] }],
+    openFrom: { 7: org => org[0] < -184 },                               // bathroom door: from the bathroom side only
+    treasure: { origin: [-248, 96, -109], name: 'golden cup' },
+  },
 };
+// what each key looks like and is called
+const KEY_LOOKS = { gold: [0xd8b030, 'gold key', 'gold'], silver: [0xc0c0d0, 'silver key', 'silver'] };
 const simpleEl = document.getElementById('simple');
 simpleEl.checked = simple;
 simpleEl.onchange = () => {
@@ -236,7 +260,7 @@ const hitsEnt = (e, org) => traceModel(e.head1, e.offset, org, org).startsolid;
 // ---------- game state ----------
 let time = 0, ents = [], world = null, events = [], P = null, M = null;
 const centerEl = document.getElementById('center'); let centerTimer = 0;
-function centerprint(msg) { centerEl.textContent = msg; centerEl.style.opacity = 1; clearTimeout(centerTimer); centerTimer = setTimeout(() => centerEl.style.opacity = 0, 2500); }
+function centerprint(msg, ms = 2500) { centerEl.textContent = msg; centerEl.style.opacity = 1; clearTimeout(centerTimer); centerTimer = setTimeout(() => centerEl.style.opacity = 0, ms); }
 function after(delay, fn) { events.push({ t: time + delay, fn }); }
 function think(e, delay, fn) { e.nextThink = time + delay; e.think = fn; }
 
@@ -262,11 +286,18 @@ function doorFire(m) {
   for (const l of m.linked) doorGoUp(l);
 }
 function doorUse(d) { doorFire(d.master); }
+// a door that opens from one side only is locked when you are on the other side
+const lockedFromHere = m => !!m.openFrom && !m.openFrom(P.org);
+function doorMessage(m) {
+  if (!m.message) return lockedFromHere(m) ? 'Locked' : '';
+  return lockedFromHere(m) ? m.message + '\nLocked' : m.message;
+}
 function doorTouch(d) {
   const m = d.master;
   if (m.attackFinished > time) return;
   m.attackFinished = time + 2;
-  if (m.message) centerprint(m.message);
+  const msg = doorMessage(m);
+  if (msg) centerprint(msg);
   if (!m.items) return;
   if (!P.items[m.items]) { centerprint(`You need the ${m.items} key`); return; }
   delete P.items[m.items]; updateStatus();
@@ -275,9 +306,17 @@ function doorTouch(d) {
 }
 function doorBlocked(d) { if (d.wait >= 0) { if (d.state === DOWN) doorGoUp(d); else doorGoDown(d); } }
 
+// a button that needs a key (MAP_MODS buttonKeys) only works once you have it; without it, it says which key
+function hasKeyFor(b) {
+  if (!b.needs || P.items[b.needs]) return true;
+  if (b.attackFinished <= time) { b.attackFinished = time + 2; centerprint(`You need the ${b.needs} key`); }
+  return false;
+}
+
 // buttons (buttons.qc)
 function buttonFire(b) {
   if (b.state === UP || b.state === TOP) return;
+  if (!hasKeyFor(b)) return;
   b.state = UP;
   calcMove(b, b.pos2, b.speed, () => { b.state = TOP; think(b, b.wait, () => buttonReturn(b)); useTargets(b); });
 }
@@ -328,6 +367,8 @@ async function show(name) {
   };
   const lm = await loader.loadAsync(m.lightmap);
   lm.flipY = false; lm.colorSpace = THREE.NoColorSpace; lm.magFilter = lm.minFilter = THREE.LinearFilter; lm.generateMipmaps = false;
+  const md = MAP_MODS[name] || {};
+  const silverNames = md.silverTextures || [];
   const mats = await Promise.all(m.textures.map(async t => {
     let tex = grey, hasMap = 0;
     if (t.url) {
@@ -336,7 +377,8 @@ async function show(name) {
       tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestMipmapLinearFilter; hasMap = 1;
     }
     return new THREE.RawShaderMaterial({ vertexShader: VERT, fragmentShader: FRAG, side: THREE.DoubleSide,
-      uniforms: { map: { value: tex }, lightmap: { value: lm }, hasMap: { value: hasMap }, bright: brightU, holeMin: holeMinU, holeMax: holeMaxU } });
+      uniforms: { map: { value: tex }, lightmap: { value: lm }, hasMap: { value: hasMap }, bright: brightU,
+                  silver: { value: silverNames.includes(t.name) ? 1 : 0 }, holeMin: holeMinU, holeMax: holeMaxU } });
   }));
   const meshFor = model => {
     const gs = m.groups[model]; if (!gs) return null;
@@ -365,19 +407,23 @@ async function show(name) {
       Object.assign(e, { model: mi, mins: cm.mins, maxs: cm.maxs, head1: cm.head1, mesh: meshFor(mi) });
       if (e.mesh) e.mesh.userData.ent = e;
       const size = sub(cm.maxs, cm.mins);
-      const speed = +kv.speed || 100, md = movedir(kv.angle);
+      const speed = +kv.speed || 100, dir = movedir(kv.angle);
       if (cls === 'func_door') {
         const lip = kv.lip !== undefined ? +kv.lip : 8;
+        // the key this door needs: the map's own (gold or silver flag) unless MAP_MODS changes it
+        const flagKey = e.spawnflags & 8 ? 'gold' : e.spawnflags & 16 ? 'silver' : null;
+        const modKey = md.doorKeys && md.doorKeys[mi];
+        // unlike Quake, a key door keeps its wait, so once unlocked it shuts again behind you like any other door
         Object.assign(e, { kind: 'door', speed, wait: kv.wait !== undefined ? +kv.wait : 3, toggle: !!(e.spawnflags & 32), health: +kv.health || 0,
-          items: e.spawnflags & 8 ? 'gold' : e.spawnflags & 16 ? 'silver' : null, state: BOTTOM, pos1: [0, 0, 0],
-          pos2: scl(md, Math.abs(dot(md, size)) - lip), use: d => doorUse(d), touch: d => doorTouch(d), blocked: d => doorBlocked(d) });
-        if (e.items) e.wait = -1;
+          items: modKey || flagKey, openFrom: (md.openFrom && md.openFrom[mi]) || null, state: BOTTOM, pos1: [0, 0, 0],
+          pos2: scl(dir, Math.abs(dot(dir, size)) - lip), use: d => doorUse(d), touch: d => doorTouch(d), blocked: d => doorBlocked(d) });
         if (e.spawnflags & 1) { e.offset = e.pos2; [e.pos1, e.pos2] = [e.pos2, e.pos1]; }
         solids.push(e);
       } else if (cls === 'func_button') {
         const lip = kv.lip !== undefined ? +kv.lip : 4;
         Object.assign(e, { kind: 'button', speed: +kv.speed || 40, wait: kv.wait !== undefined ? +kv.wait || 1 : 1, health: +kv.health || 0,
-          state: BOTTOM, pos1: [0, 0, 0], pos2: scl(md, Math.abs(dot(md, size)) - lip), use: b => buttonFire(b) });
+          needs: (md.buttonKeys && md.buttonKeys[mi]) || null, attackFinished: 0,
+          state: BOTTOM, pos1: [0, 0, 0], pos2: scl(dir, Math.abs(dot(dir, size)) - lip), use: b => buttonFire(b) });
         if (!e.health) e.touch = b => buttonFire(b);
         solids.push(e);
       } else if (cls === 'func_door_secret') {
@@ -410,7 +456,8 @@ async function show(name) {
         let z = org[2]; while (z > org[2] - 1000 && pointContents([org[0], org[1], z]) !== SOLID) z--;
         org[2] = Math.round(z + (org[2] - z) / 2);
       }
-      const look = cls === 'item_key2' ? [0xd8b030, 'gold key', 'gold'] : cls === 'item_key1' ? [0xc0c0d0, 'silver key', 'silver']
+      const swapped = md.pickups && md.pickups[cls];   // MAP_MODS can turn an item into a key
+      const look = swapped ? KEY_LOOKS[swapped] : cls === 'item_key2' ? KEY_LOOKS.gold : cls === 'item_key1' ? KEY_LOOKS.silver
                  : cls.includes('envirosuit') ? [0x50c050, 'Biosuit'] : cls.includes('invisibility') ? [0xc04040, 'Ring of Shadows']
                  : cls.includes('invulnerability') ? [0xd04040, 'Pentagram of Protection'] : cls.includes('super_damage') ? [0x6060ff, 'Quad Damage']
                  : cls.includes('health') ? [0xd06060, 'health'] : [0xb0a080, cls.replace(/^item_/, '').replace(/_/g, ' ')];
@@ -442,17 +489,99 @@ async function show(name) {
       if (l.targetname) d.targetname = d.targetname || l.targetname;
       if (l.message) d.message = l.message;
       if (l.items) d.items = l.items;
+      if (l.openFrom) d.openFrom = l.openFrom;
     }
     d.attackFinished = 0;
-    if (d.health || d.targetname || d.items) continue;
+    // key doors get an approach trigger too: it does nothing until the door is unlocked, then opens it like any door
+    if (d.health || d.targetname) continue;
     let mn = d.mins.slice(), mx = d.maxs.slice();
     for (const l of d.linked) for (let k = 0; k < 3; k++) { mn[k] = Math.min(mn[k], l.mins[k]); mx[k] = Math.max(mx[k], l.maxs[k]); }
     ents.push({ kind: 'field', door: d, mins: sub(mn, [60, 60, 8]), maxs: add(mx, [60, 60, 8]), nextTouch: 0, offset: [0, 0, 0],
-      touchTrigger: f => { if (f.door.state !== TOP && f.door.state !== UP && f.door.message) centerprint(f.door.message); doorUse(f.door); } });
+      touchTrigger: f => fieldTouch(f) });
   }
 
+  addKeyLogos(md, mats, m.textures.map(t => t.name), lm);
+  if (md.treasure) ents.push(makeTreasure(md.treasure));
   spawnPlayer();
   document.getElementById('info').textContent = m.triangles.toLocaleString() + ' triangles';
+}
+
+// walking up to a door (its approach trigger)
+function fieldTouch(f) {
+  const d = f.door;
+  // still locked with a key: touching the door itself says which key it needs
+  if (d.items) return;
+  const isOpen = d.state === TOP || d.state === UP;
+  // a one-way door you are on the wrong side of: say it is locked and leave it shut
+  if (lockedFromHere(d)) {
+    if (!isOpen) centerprint(doorMessage(d));
+    return;
+  }
+  // otherwise open it (or keep it open), naming the room as it opens
+  if (!isOpen && d.message) centerprint(d.message);
+  doorUse(d);
+}
+
+// key logos added to doors (MAP_MODS keyLogos): a flat picture on each door's outer face that moves with the door
+function addKeyLogos(md, mats, texNames, lm) {
+  const lmv = [1 / lm.image.width, 1 / lm.image.height];   // the lightmap's neutral corner: plain, even light
+  for (const logo of md.keyLogos || []) {
+    const ti = texNames.indexOf(logo.texture);
+    if (ti < 0) continue;
+    const src = mats[ti];
+    // its own material, so it keeps the texture's gold even where that texture is turned silver elsewhere
+    const mat = new THREE.RawShaderMaterial({ vertexShader: VERT, fragmentShader: FRAG, side: THREE.DoubleSide,
+      uniforms: { map: src.uniforms.map, lightmap: { value: lm }, hasMap: src.uniforms.hasMap, bright: brightU,
+                  silver: { value: 0 }, holeMin: noHole(), holeMax: noHole() } });
+    for (const mi of logo.models) {
+      const door = ents.find(e => e.model === mi);
+      if (!door || !door.mesh) continue;
+      const cm = C.models[mi];
+      // centre of the door's outer face (the side with the lower y), a fraction in front of it
+      // (a brush model's stored bounds sit 1 unit inside its faces)
+      const y = cm.mins[1] - 1.3;
+      const cx = (cm.mins[0] + cm.maxs[0]) / 2;
+      const cz = (cm.mins[2] + cm.maxs[2]) / 2;
+      const hw = logo.size[0] / 2, hh = logo.size[1] / 2;
+      // seen from this side, +x is on your right, so the u range runs right to left to match the bedroom door
+      const corners = [
+        { q: [cx - hw, y, cz + hh], uv: [logo.u[1], logo.v[0]] },   // top left
+        { q: [cx + hw, y, cz + hh], uv: [logo.u[0], logo.v[0]] },   // top right
+        { q: [cx + hw, y, cz - hh], uv: [logo.u[0], logo.v[1]] },   // bottom right
+        { q: [cx - hw, y, cz - hh], uv: [logo.u[1], logo.v[1]] },   // bottom left
+      ];
+      const pos = [], uv = [], lmuv = [], shade = [];
+      for (const k of [0, 1, 2, 0, 2, 3]) {
+        const t = q2t(corners[k].q);
+        pos.push(t.x, t.y, t.z);
+        uv.push(...corners[k].uv);
+        lmuv.push(...lmv);
+        shade.push(1);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+      g.setAttribute('lmuv', new THREE.Float32BufferAttribute(lmuv, 2));
+      g.setAttribute('shade', new THREE.Float32BufferAttribute(shade, 1));
+      const logoMesh = toThreeMesh(g, mat);
+      logoMesh.userData.ent = door;   // shooting the logo counts as shooting the door
+      door.mesh.add(logoMesh);        // a child of the door, so it slides away with it
+    }
+  }
+}
+
+// the level's goal (MAP_MODS treasure): a spinning golden cup you pick up
+function makeTreasure(tr) {
+  const org = tr.origin.slice();
+  // a goblet turned on a lathe: foot, stem, bowl (radius, height)
+  const profile = [[0, 0], [7, 0], [7, 1.5], [2.2, 3.5], [1.6, 10], [3, 12], [8, 16], [9.5, 25], [8.3, 25], [7, 17.5], [0, 15.5]];
+  const geo = new THREE.LatheGeometry(profile.map(([r, h]) => new THREE.Vector2(r, h)), 10);
+  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0xe6b422, side: THREE.DoubleSide }));
+  mesh.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x6a4a08, wireframe: true })));   // facet lines, like the keys
+  mesh.position.copy(q2t(org));
+  scene.add(mesh);
+  return { kind: 'item', treasure: true, origin: org, mesh, name: tr.name, removed: false, offset: [0, 0, 0],
+           mins: add(org, [-16, -16, -24]), maxs: add(org, [16, 16, 32]) };
 }
 
 function buildMods(name, mats, lm) {
@@ -502,8 +631,8 @@ function buildMods(name, mats, lm) {
   g.setAttribute('lmuv', new THREE.Float32BufferAttribute(lmuv, 2));
   g.setAttribute('shade', new THREE.Float32BufferAttribute(shade, 1));
   const m2 = new THREE.RawShaderMaterial({ vertexShader: VERT, fragmentShader: FRAG, side: THREE.DoubleSide,
-    uniforms: { map: mat.uniforms.map, lightmap: { value: lm }, hasMap: mat.uniforms.hasMap, bright: brightU,
-                holeMin: { value: new THREE.Vector3(1e9, 1e9, 1e9) }, holeMax: { value: new THREE.Vector3(1e9, 1e9, 1e9) } } });
+    uniforms: { map: mat.uniforms.map, lightmap: { value: lm }, hasMap: mat.uniforms.hasMap, bright: brightU, silver: mat.uniforms.silver,
+                holeMin: noHole(), holeMax: noHole() } });
   scene.add(toThreeMesh(g, m2));
 }
 
@@ -519,13 +648,22 @@ function teleport(t) {
 function spawnPlayer() {
   const s = M.spawn;
   P = { org: add(s.slice(0, 3), [0, 0, 1]), vel: [0, 0, 0], yaw: (s[3] - 90) * Math.PI / 180, pitch: 0, ground: null,
-        noclip: false, items: {}, jumpReleased: true, waterlevel: 0, watertype: EMPTY };
+        noclip: false, items: {}, treasure: false, startTime: time, jumpReleased: true, waterlevel: 0, watertype: EMPTY };
   for (let i = 0; i < 64 && stuck(P.org); i++) P.org[2] += 4;
+  // a restart puts the keys and the cup back, so the level can be played again
+  for (const e of ents) if (e.kind === 'item') { e.removed = false; e.mesh.visible = true; }
   updateStatus();
 }
 function updateStatus() {
   const k = Object.keys(P.items).map(x => x + ' key');
-  document.getElementById('status').textContent = (P.noclip ? 'NOCLIP  ' : '') + (k.length ? 'Keys: ' + k.join(', ') : 'No keys');
+  const keysText = k.length ? 'Keys: ' + k.join(', ') : 'No keys';
+  const cupText = P.treasure ? '  ·  Golden cup found!' : '';
+  document.getElementById('status').textContent = (P.noclip ? 'NOCLIP  ' : '') + keysText + cupText;
+}
+// m:ss since the start (or the last restart)
+function playTime() {
+  const secs = Math.floor(time - P.startTime);
+  return Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
 }
 
 const keys = {};
@@ -714,7 +852,12 @@ function triggersTick() {
       if (boxesTouch(pmn, pmx, e.mins, e.maxs)) {
         e.removed = true; e.mesh.visible = false;
         if (e.key) P.items[e.key] = true;
-        centerprint('You got the ' + e.name); updateStatus();
+        if (e.treasure) {
+          // the goal of the level
+          P.treasure = true;
+          centerprint(`You found the ${e.name}!\nLevel complete in ${playTime()}`, 8000);
+        } else centerprint('You got the ' + e.name);
+        updateStatus();
       }
     } else if (e.touchTrigger && (e.kind === 'trigger' || e.kind === 'field')) {
       if (time < e.nextTouch) continue;
@@ -760,7 +903,10 @@ renderer.setAnimationLoop(() => {
 // beak8v is the most developed version of the house; the older builds' data files stay in this folder unused
 // (open viewer.html?map=house7gi, for example, to look at one).
 show(new URLSearchParams(location.search).get('map') || 'beak8v');
-window.__qmv = { get P() { return P; }, get ents() { return ents; }, trace, shoot, keys, pointContents, get time() { return time; } };
+// for the tests (tests/game.test.mjs): read the game state and run the game forward without waiting
+window.__qmv = { get P() { return P; }, get ents() { return ents; }, get world() { return world; }, trace, shoot, keys, pointContents,
+  get time() { return time; }, spawnPlayer, centerText: () => centerEl.textContent,
+  step: secs => { for (let i = 0; i < Math.round(secs * 72); i++) gameTick(TICK); } };
 </script>
 </body>
 </html>
